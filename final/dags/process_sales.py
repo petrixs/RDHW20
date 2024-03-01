@@ -4,9 +4,6 @@ from datetime import datetime
 from airflow.providers.google.cloud.operators.bigquery import BigQueryExecuteQueryOperator
 from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
 
-# 71,085
-# 2366
-
 PROJECT_ID = 'de-07-petro-tsesar'
 RAW_BUCKET = 'petr-tsesar-bucket'
 
@@ -25,6 +22,26 @@ process_sales = DAG(
     max_active_runs=1,
     catchup=True,
     end_date=datetime(2022, 10, 1)
+)
+
+conditional_clear_bronze_sales_for_date = BigQueryExecuteQueryOperator(
+    task_id='conditional_clear_bronze_sales_for_date',
+    sql=f"""
+        DECLARE table_exists BOOL DEFAULT (
+            SELECT
+                COUNT(1) > 0
+            FROM `{PROJECT_ID}.{BRONZE_DATASET}.__TABLES__`
+            WHERE table_id = '{SALES_TABLE_NAME}'
+        );
+
+        IF table_exists THEN
+            DELETE FROM `{PROJECT_ID}.{BRONZE_DATASET}.{SALES_TABLE_NAME}`
+            WHERE PurchaseDate = "{date}";
+        END IF;
+    """,
+    use_legacy_sql=False,
+    gcp_conn_id='GC',
+    dag=process_sales,
 )
 
 fill_bronze_sales = GCSToBigQueryOperator(
@@ -57,6 +74,8 @@ transform_and_fill_silver_sales = BigQueryExecuteQueryOperator(
         IF NOT table_exists THEN 
           EXECUTE IMMEDIATE "CREATE TABLE `{PROJECT_ID}.{SILVER_DATASET}.{SALES_TABLE_NAME}` (client_id INT64, purchase_date DATE, product_name STRING, price DECIMAL(10, 2)) PARTITION BY purchase_date"; 
         END IF; 
+        
+        DELETE FROM `{PROJECT_ID}.{SILVER_DATASET}.{SALES_TABLE_NAME}` WHERE purchase_date=DATE("{date}");
 
         INSERT INTO `{PROJECT_ID}.{SILVER_DATASET}.{SALES_TABLE_NAME}` (client_id, purchase_date, product_name, price)
         SELECT
@@ -79,4 +98,4 @@ transform_and_fill_silver_sales = BigQueryExecuteQueryOperator(
     dag=process_sales,
 )
 
-fill_bronze_sales >> transform_and_fill_silver_sales
+conditional_clear_bronze_sales_for_date >> fill_bronze_sales >> transform_and_fill_silver_sales

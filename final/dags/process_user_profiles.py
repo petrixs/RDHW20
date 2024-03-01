@@ -1,5 +1,6 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.google.cloud.hooks import bigquery
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from airflow.providers.google.cloud.operators.bigquery import BigQueryExecuteQueryOperator
@@ -88,6 +89,13 @@ update_customers_data = BigQueryExecuteQueryOperator(
     gcp_conn_id='GC'
 )
 
-fill_silver_profiles >> add_birthdate_if_not_exists_task >> update_customers_data
+trigger_enrich_user_profiles = TriggerDagRunOperator(
+    task_id='trigger_enrich_user_profiles',
+    trigger_dag_id='enrich_user_profiles',
+    dag=process_user_profiles,
+)
+
+
+fill_silver_profiles >> add_birthdate_if_not_exists_task >> update_customers_data >> trigger_enrich_user_profiles
 
 
