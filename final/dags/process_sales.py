@@ -1,7 +1,7 @@
 from airflow import DAG
 from datetime import datetime
 
-from airflow.providers.google.cloud.operators.bigquery import BigQueryExecuteQueryOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryExecuteQueryOperator, BigQueryDeleteTableOperator
 from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
 
 PROJECT_ID = 'de-07-petro-tsesar'
@@ -24,6 +24,46 @@ process_sales = DAG(
     end_date=datetime(2022, 10, 1)
 )
 
+load_data_to_temp_table = GCSToBigQueryOperator(
+    task_id='load_data_to_temp_table',
+    bucket=RAW_BUCKET,
+    source_objects=[IMPORT_FILENAMES_TEMPLATE],
+    destination_project_dataset_table=f"{PROJECT_ID}:{BRONZE_DATASET}.temp_{date}_{SALES_TABLE_NAME}",
+    schema_fields=[
+        {'name': 'CustomerId', 'type': 'STRING', 'mode': 'REQUIRED'},
+        {'name': 'PurchaseDate', 'type': 'STRING', 'mode': 'REQUIRED'},
+        {'name': 'Product', 'type': 'STRING', 'mode': 'REQUIRED'},
+        {'name': 'Price', 'type': 'STRING', 'mode': 'REQUIRED'}
+    ],
+    write_disposition='WRITE_TRUNCATE',
+    gcp_conn_id='GC',
+    dag=process_sales,
+)
+
+
+delete_temp_table = BigQueryDeleteTableOperator(
+    task_id='delete_temp_table',
+    deletion_dataset_table=f"{PROJECT_ID}.{BRONZE_DATASET}.temp_{date}_{SALES_TABLE_NAME}",
+    gcp_conn_id='GC',
+    dag=process_sales,
+)
+
+create_bronze_table_if_not_exists = BigQueryExecuteQueryOperator(
+    task_id='create_bronze_table_if_not_exists',
+    sql=f"""
+        CREATE TABLE IF NOT EXISTS `{PROJECT_ID}.{BRONZE_DATASET}.{SALES_TABLE_NAME}` (
+            CustomerId STRING,
+            PurchaseDate STRING,
+            Product STRING,
+            Price STRING,
+            _dag_exec_date DATE
+        )
+    """,
+    use_legacy_sql=False,
+    gcp_conn_id='GC',
+    dag=process_sales,
+)
+
 conditional_clear_bronze_sales_for_date = BigQueryExecuteQueryOperator(
     task_id='conditional_clear_bronze_sales_for_date',
     sql=f"""
@@ -44,18 +84,14 @@ conditional_clear_bronze_sales_for_date = BigQueryExecuteQueryOperator(
     dag=process_sales,
 )
 
-fill_bronze_sales = GCSToBigQueryOperator(
-    task_id='fill_bronze_sales',
-    bucket=RAW_BUCKET,
-    source_objects=[IMPORT_FILENAMES_TEMPLATE],
-    destination_project_dataset_table=f'{PROJECT_ID}:{BRONZE_DATASET}.{SALES_TABLE_NAME}',
-    schema_fields=[
-        {'name': 'CustomerId', 'type': 'STRING', 'mode': 'REQUIRED'},
-        {'name': 'PurchaseDate', 'type': 'STRING', 'mode': 'REQUIRED'},
-        {'name': 'Product', 'type': 'STRING', 'mode': 'REQUIRED'},
-        {'name': 'Price', 'type': 'STRING', 'mode': 'REQUIRED'}
-    ],
-    write_disposition='WRITE_APPEND',
+fill_bronze_sales = BigQueryExecuteQueryOperator(
+    task_id='transfer_data_to_bronze',
+    sql=f"""
+        INSERT INTO `{PROJECT_ID}.{BRONZE_DATASET}.{SALES_TABLE_NAME}` (CustomerId, PurchaseDate, Product, Price, _dag_exec_date)
+        SELECT CustomerId, PurchaseDate, Product, Price, DATE('{date}') AS _dag_exec_date
+        FROM `{PROJECT_ID}.{BRONZE_DATASET}.temp_{date}_{SALES_TABLE_NAME}`
+    """,
+    use_legacy_sql=False,
     gcp_conn_id='GC',
     dag=process_sales,
 )
@@ -80,22 +116,15 @@ transform_and_fill_silver_sales = BigQueryExecuteQueryOperator(
         INSERT INTO `{PROJECT_ID}.{SILVER_DATASET}.{SALES_TABLE_NAME}` (client_id, purchase_date, product_name, price)
         SELECT
           CAST(CustomerId AS INT64) AS client_id,
-          CASE
-            WHEN REGEXP_CONTAINS(PurchaseDate, r'^\\d{{4}}/\\d{{2}}/\\d{{1,2}}$') THEN PARSE_DATE('%Y/%m/%d', PurchaseDate)
-            WHEN REGEXP_CONTAINS(PurchaseDate, r'^\\d{{4}}-\\d{{2}}-\\d{{1,2}}$') THEN PARSE_DATE('%Y-%m-%d', PurchaseDate)
-            WHEN REGEXP_CONTAINS(PurchaseDate, r'^\\d{{4}}-[A-Za-z]+-\\d{{1,2}}$') THEN PARSE_DATE('%Y-%b-%d', PurchaseDate)
-            ELSE DATE(PurchaseDate)
-          END AS purchase_date,
+          DATE(_dag_exec_date) AS purchase_date,
           Product AS product_name,
           CAST(REGEXP_REPLACE(Price, r'[^0-9]', '') AS DECIMAL) AS price
         FROM `{PROJECT_ID}.{BRONZE_DATASET}.{SALES_TABLE_NAME}`
-        WHERE PurchaseDate = "{ date }" OR 
-              PurchaseDate = FORMAT_DATE('%Y-%b-%d', PARSE_DATE('%Y-%m-%d', '{ date }')) OR 
-              PurchaseDate = FORMAT_DATE('%Y/%m/%d', PARSE_DATE('%Y-%m-%d', '{ date }'))
+        WHERE _dag_exec_date = DATE("{ date }")
     """,
     use_legacy_sql=False,
     gcp_conn_id='GC',
     dag=process_sales,
 )
 
-conditional_clear_bronze_sales_for_date >> fill_bronze_sales >> transform_and_fill_silver_sales
+load_data_to_temp_table >> create_bronze_table_if_not_exists >> conditional_clear_bronze_sales_for_date >> fill_bronze_sales >> delete_temp_table >> transform_and_fill_silver_sales
